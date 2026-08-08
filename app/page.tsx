@@ -533,7 +533,7 @@ function scoreResult(params: {
   knowledgeReferences: KnowledgeReference[];
   error: string;
   durationMs: number;
-}) {
+}): Pick<TestResult, "moduleScores" | "totalScore" | "status"> {
   const { profile, testCase, finalAnswer, actualIntent, knowledgeReferences, error, durationMs } = params;
   const scores: Partial<Record<ModuleKey, ModuleScore>> = {};
   const activeModules = testCase.modules.filter((moduleKey) => profile.enabledModules[moduleKey]);
@@ -637,7 +637,7 @@ function scoreResult(params: {
   const hasReview = weightedItems.some(([, value]) => value.status === "review");
   const status = hasFail ? "fail" : hasReview ? "review" : "pass";
 
-  return { scores, totalScore, status };
+  return { moduleScores: scores, totalScore, status };
 }
 
 export default function Home() {
@@ -856,7 +856,7 @@ export default function Home() {
       knowledgeReferences,
       error,
       rawResponses,
-      moduleScores: scored.scores,
+      moduleScores: scored.moduleScores,
       totalScore: scored.totalScore,
       status: scored.status,
     } satisfies TestResult;
