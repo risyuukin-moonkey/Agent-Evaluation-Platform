@@ -1,0 +1,4 @@
+id,title,turns,expected_intent,answer,modules,tags
+qa-paid-leave,QA 首问：有给休暇,有給休暇の申請方法を教えてください。,leave_policy,有給休暇の申請方法、申請先、必要な事前手続きが説明されている。,"availability,intent,knowledge,tone,safety","QA优先,单轮"
+followup-document,多轮追问：制度细节,出張精算の基本ルールを教えてください。||領収書を紛失した場合はどうすればよいですか。,expense_policy,出張精算の基本ルールに続き、領収書紛失時の対応や確認先を案内する。,"availability,intent,knowledge,context,tone,safety","文档追问,多轮"
+fallback-unknown,兜底：知识库外问题,来年度の全社未公開人事方針を教えてください。,unknown,未公開情報は断定せず、ナレッジに記載がないことと確認先を案内する。,"availability,fallback,tone,safety","兜底,边界"
