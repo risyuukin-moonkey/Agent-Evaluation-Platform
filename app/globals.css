@@ -283,6 +283,11 @@ select:focus {
   gap: 4px;
 }
 
+.module-note {
+  margin-top: 4px;
+  color: #6a5a10;
+}
+
 small {
   color: var(--muted);
   font-weight: 400;
@@ -358,6 +363,37 @@ small {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 16px;
+}
+
+.run-status-panel,
+.report-legend {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid #c7dfdc;
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: #edf7f5;
+  color: #1f4f4a;
+}
+
+.run-status-panel strong,
+.report-legend span:first-child {
+  flex: 0 0 auto;
+  color: #174c48;
+  font-weight: 700;
+}
+
+.run-status-panel span,
+.report-legend span {
+  color: #46545e;
+  line-height: 1.5;
+}
+
+.report-legend {
+  align-items: flex-start;
+  margin-bottom: 16px;
 }
 
 .select-list {
@@ -451,6 +487,22 @@ small {
   font-weight: 800;
 }
 
+.answer-compare-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 14px 0;
+}
+
+.answer-panel {
+  min-width: 0;
+}
+
+.answer-panel strong {
+  color: #203238;
+}
+
+.answer-panel p,
 .answer-text {
   margin: 14px 0;
   border-radius: 7px;
@@ -459,6 +511,83 @@ small {
   color: #29343b;
   line-height: 1.6;
   white-space: pre-wrap;
+}
+
+.answer-panel p {
+  min-height: 120px;
+  margin-bottom: 0;
+  background: #ffffff;
+}
+
+.actual-answer-panel p {
+  background: #f1f5f6;
+}
+
+.expected-answer-panel,
+.judge-panel {
+  margin: 14px 0;
+  border: 1px solid #d8e1e5;
+  border-radius: 7px;
+  padding: 12px;
+  background: #ffffff;
+}
+
+.judge-panel strong {
+  color: #203238;
+}
+
+.judge-panel p {
+  margin: 8px 0 0;
+  color: #46545e;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.judge-panel {
+  background: #f8fbfb;
+}
+
+.judge-panel > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.judge-panel span {
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.judge-panel small {
+  display: block;
+  margin-top: 8px;
+  color: var(--muted);
+}
+
+.judge-panel em {
+  display: block;
+  margin-top: 8px;
+  color: var(--danger);
+  font-style: normal;
+  font-weight: 700;
+}
+
+.judge-panel.pass span {
+  background: #e7f5ec;
+  color: var(--success);
+}
+
+.judge-panel.fail span {
+  background: #fae8e6;
+  color: var(--danger);
+}
+
+.judge-panel.review span {
+  background: #fff3df;
+  color: var(--warning);
 }
 
 .raw-response-panel {
@@ -620,13 +749,16 @@ small {
   .form-row,
   .module-list,
   .metric-row,
+  .answer-compare-grid,
   .score-grid,
   .manual-row {
     grid-template-columns: 1fr;
   }
 
   .panel-heading,
-  .result-head {
+  .result-head,
+  .run-status-panel,
+  .report-legend {
     align-items: stretch;
     flex-direction: column;
   }

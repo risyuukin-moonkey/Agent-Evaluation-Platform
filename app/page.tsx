@@ -84,16 +84,39 @@ type KnowledgeReference = {
   dataset: string;
 };
 
+type JudgeDecision = "pass" | "review" | "fail";
+
+type JudgeResult = {
+  sameMeaning: boolean;
+  confidence: number;
+  decision: JudgeDecision;
+  reason: string;
+};
+
+type JudgeEvaluation = {
+  source: "judge-agent" | "keyword-fallback";
+  decision: JudgeDecision;
+  reason: string;
+  sameMeaning?: boolean;
+  confidence?: number;
+  keywordScore?: number;
+  error?: string;
+  rawAnswer?: string;
+  rawResponse?: unknown;
+};
+
 type TestResult = {
   id: string;
   caseId: string;
   caseTitle: string;
+  expectedAnswer: string;
   startedAt: string;
   durationMs: number;
   finalAnswer: string;
   actualIntent: string;
   knowledgeSource: string;
   knowledgeReferences: KnowledgeReference[];
+  judgeEvaluation?: JudgeEvaluation;
   error: string;
   rawResponses: unknown[];
   moduleScores: Partial<Record<ModuleKey, ModuleScore>>;
@@ -208,6 +231,11 @@ const sampleCases: TestCase[] = [
   },
 ];
 
+const defaultNotice = "第一版已内置一波示例 Profile。填入接口文档信息后即可批量测试。";
+const testCasesNotice =
+  "第一版已内置一波示例 Profile。填入接口文档信息后即可批量测试。注意test case请用User: 和 Agent:的形式呈现。";
+const agentSystemExceptionReason = "被测 agent 返回系统异常，无法进行语义一致性判断。";
+
 function getStored<T>(key: string, fallback: T): T {
   if (typeof window === "undefined") return fallback;
   try {
@@ -277,6 +305,14 @@ function keywordScore(answer: string, expected: string) {
 
 function looksJapanese(text: string) {
   return /[\u3040-\u30ff\u3400-\u9fff]/.test(text) && /です|ます|ください|いたします|ございます/.test(text);
+}
+
+function isAgentSystemException(answer: string) {
+  return /system exception/i.test(answer) || /please try again later/i.test(answer);
+}
+
+function isExactAnswerMatch(actualAnswer: string, expectedAnswer: string) {
+  return actualAnswer.trim() === expectedAnswer.trim();
 }
 
 function parseJsonObject(text: string) {
@@ -484,7 +520,7 @@ function mapRowsToCases(rows: Record<string, string>[]): TestCase[] {
       "模範回答",
       "期待回答",
     ]);
-    const moduleText = getRowValue(row, ["modules", "module", "测试模块", "评测模块"]);
+    const moduleText = getRowValue(row, ["modules", "module", "测试模块", "评测模块", "モジュール", "評価モジュール"]);
     const evaluationText = getRowValue(row, ["評価観点", "评估维度", "评价维度", "evaluation", "evaluation_points"]);
     const inferredModules = modulesFromEvaluationText(evaluationText);
     const modules = (moduleText || "")
@@ -525,26 +561,92 @@ function buildRequestBody(template: string, values: Record<string, string>) {
   return template.replace(/\{\{(\w+)\}\}/g, (_, key: string) => values[key] ?? "");
 }
 
+function buildConversationId(testCase: TestCase) {
+  const safeCaseId = testCase.id.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 48) || "case";
+  return `autotest-${safeCaseId}-${Date.now()}`;
+}
+
+async function callJudgeProxy(testCase: TestCase, actualAnswer: string, timeoutSeconds: number): Promise<JudgeEvaluation> {
+  const keywordFallbackScore = keywordScore(actualAnswer, testCase.expectedAnswer);
+  try {
+    const response = await fetch("/api/judge-proxy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        caseId: testCase.id,
+        question: testCase.turns.at(-1) ?? "",
+        expectedAnswer: testCase.expectedAnswer,
+        actualAnswer,
+        timeoutSeconds,
+      }),
+    });
+    const payload = (await response.json()) as {
+      ok?: boolean;
+      result?: JudgeResult;
+      rawAnswer?: string;
+      rawResponse?: unknown;
+      error?: string;
+      fallbackReason?: string;
+    };
+
+    if (response.ok && payload.ok && payload.result) {
+      return {
+        source: "judge-agent",
+        decision: payload.result.decision,
+        sameMeaning: payload.result.sameMeaning,
+        confidence: payload.result.confidence,
+        reason: payload.result.reason,
+        rawAnswer: payload.rawAnswer,
+        rawResponse: payload.rawResponse,
+      };
+    }
+
+    return {
+      source: "keyword-fallback",
+      decision: "review",
+      keywordScore: keywordFallbackScore,
+      error: payload.error || `Judge Agent 返回 ${response.status}`,
+      reason: payload.fallbackReason || "Judge Agent 未能返回有效判断，使用 keywordScore 作为参考并进入人工复核。",
+      rawAnswer: payload.rawAnswer,
+      rawResponse: payload.rawResponse ?? payload,
+    };
+  } catch (caught) {
+    return {
+      source: "keyword-fallback",
+      decision: "review",
+      keywordScore: keywordFallbackScore,
+      error: caught instanceof Error ? caught.message : "Judge Agent 调用失败",
+      reason: "Judge Agent 调用失败，使用 keywordScore 作为参考并进入人工复核。",
+    };
+  }
+}
+
 function scoreResult(params: {
   profile: Profile;
   testCase: TestCase;
   finalAnswer: string;
   actualIntent: string;
   knowledgeReferences: KnowledgeReference[];
+  judgeEvaluation?: JudgeEvaluation;
   error: string;
   durationMs: number;
 }): Pick<TestResult, "moduleScores" | "totalScore" | "status"> {
-  const { profile, testCase, finalAnswer, actualIntent, knowledgeReferences, error, durationMs } = params;
+  const { profile, testCase, finalAnswer, actualIntent, knowledgeReferences, judgeEvaluation, error, durationMs } = params;
   const scores: Partial<Record<ModuleKey, ModuleScore>> = {};
-  const activeModules = testCase.modules.filter((moduleKey) => profile.enabledModules[moduleKey]);
+  const activeModules = moduleCatalog.map((item) => item.key).filter((moduleKey) => profile.enabledModules[moduleKey]);
 
   for (const moduleKey of activeModules) {
     if (moduleKey === "availability") {
-      const ok = !error && finalAnswer.trim().length > 0 && durationMs <= profile.rules.maxResponseSeconds * 1000;
+      const systemException = isAgentSystemException(finalAnswer);
+      const ok = !error && !systemException && finalAnswer.trim().length > 0 && durationMs <= profile.rules.maxResponseSeconds * 1000;
       scores[moduleKey] = {
-        score: ok ? 100 : finalAnswer ? 55 : 0,
+        score: ok ? 100 : systemException ? 0 : finalAnswer ? 55 : 0,
         status: ok ? "pass" : "fail",
-        reason: ok ? "接口正常返回有效回答。" : error || "回答为空或响应时间超过阈值。",
+        reason: ok
+          ? "接口正常返回有效回答。"
+          : systemException
+            ? agentSystemExceptionReason
+            : error || "回答为空或响应时间超过阈值。",
       };
     } else if (moduleKey === "intent") {
       if (!testCase.expectedIntent || !actualIntent) {
@@ -562,13 +664,38 @@ function scoreResult(params: {
         };
       }
     } else if (moduleKey === "knowledge") {
+      if (isAgentSystemException(finalAnswer)) {
+        scores[moduleKey] = {
+          score: 0,
+          status: "fail",
+          reason: agentSystemExceptionReason,
+        };
+        continue;
+      }
       const answerScore = keywordScore(finalAnswer, testCase.expectedAnswer);
       const referenceBonus = knowledgeReferences.length > 0 ? 12 : 0;
+      if (judgeEvaluation?.source === "judge-agent") {
+        const score =
+          judgeEvaluation.decision === "pass"
+            ? Math.max(85, Math.round((judgeEvaluation.confidence ?? 0.85) * 100))
+            : judgeEvaluation.decision === "fail"
+              ? Math.min(35, Math.round((judgeEvaluation.confidence ?? 0.65) * 100))
+              : Math.min(74, Math.max(45, Math.round((judgeEvaluation.confidence ?? 0.5) * 100)));
+        scores[moduleKey] = {
+          score,
+          status: judgeEvaluation.decision,
+          reason: `Judge Agent：${judgeEvaluation.reason}`,
+        };
+        continue;
+      }
       const score = Math.min(100, answerScore + referenceBonus);
       scores[moduleKey] = {
         score,
-        status: score >= 75 ? "pass" : "review",
+        status: judgeEvaluation?.source === "keyword-fallback" ? "review" : score >= 75 ? "pass" : "review",
         reason:
+          judgeEvaluation?.source === "keyword-fallback"
+            ? `${judgeEvaluation.reason} keywordScore: ${judgeEvaluation.keywordScore ?? answerScore}。`
+            :
           score >= 75
             ? knowledgeReferences.length
               ? `回答覆盖了较多参考答案核心要点，并查询到 ${knowledgeReferences.length} 条知识引用。`
@@ -641,29 +768,48 @@ function scoreResult(params: {
 }
 
 export default function Home() {
-  const [agentConfig, setAgentConfig] = useState<AgentConfig>(() => getStored("agent-config", defaultAgentConfig));
-  const [knowledgeConfig, setKnowledgeConfig] = useState<KnowledgeReferenceConfig>(() =>
-    getStored("knowledge-reference-config", defaultKnowledgeConfig),
-  );
-  const [profile, setProfile] = useState<Profile>(() => getStored("agent-profile", defaultProfile));
-  const [cases, setCases] = useState<TestCase[]>(() => getStored("test-cases", sampleCases));
-  const [results, setResults] = useState<TestResult[]>(() => getStored("test-results", []));
+  const [hasLoadedStoredState, setHasLoadedStoredState] = useState(false);
+  const [agentConfig, setAgentConfig] = useState<AgentConfig>(defaultAgentConfig);
+  const [knowledgeConfig, setKnowledgeConfig] = useState<KnowledgeReferenceConfig>(defaultKnowledgeConfig);
+  const [profile, setProfile] = useState<Profile>(defaultProfile);
+  const [cases, setCases] = useState<TestCase[]>(sampleCases);
+  const [results, setResults] = useState<TestResult[]>([]);
   const [activeTab, setActiveTab] = useState<"setup" | "cases" | "run" | "report">("setup");
   const [selectedCaseIds, setSelectedCaseIds] = useState<string[]>(() => sampleCases.map((item) => item.id));
   const [isRunning, setIsRunning] = useState(false);
-  const [notice, setNotice] = useState("第一版已内置一波示例 Profile。填入接口文档信息后即可批量测试。");
+  const [runStage, setRunStage] = useState("");
+  const [notice, setNotice] = useState(defaultNotice);
 
   useEffect(() => {
-    if (shouldReplaceOldAgentExample(agentConfig)) {
-      setAgentConfig(defaultAgentConfig);
-    }
+    const timeoutId = window.setTimeout(() => {
+      const storedConfig = getStored("agent-config", defaultAgentConfig);
+      const storedCases = getStored("test-cases", sampleCases);
+      setAgentConfig(shouldReplaceOldAgentExample(storedConfig) ? defaultAgentConfig : storedConfig);
+      setKnowledgeConfig(getStored("knowledge-reference-config", defaultKnowledgeConfig));
+      setProfile(getStored("agent-profile", defaultProfile));
+      setCases(storedCases);
+      setSelectedCaseIds(storedCases.map((item) => item.id));
+      setResults(getStored("test-results", []));
+      setHasLoadedStoredState(true);
+    }, 0);
+    return () => window.clearTimeout(timeoutId);
   }, []);
 
-  useEffect(() => setStored("agent-config", agentConfig), [agentConfig]);
-  useEffect(() => setStored("knowledge-reference-config", knowledgeConfig), [knowledgeConfig]);
-  useEffect(() => setStored("agent-profile", profile), [profile]);
-  useEffect(() => setStored("test-cases", cases), [cases]);
-  useEffect(() => setStored("test-results", results), [results]);
+  useEffect(() => {
+    if (hasLoadedStoredState) setStored("agent-config", agentConfig);
+  }, [agentConfig, hasLoadedStoredState]);
+  useEffect(() => {
+    if (hasLoadedStoredState) setStored("knowledge-reference-config", knowledgeConfig);
+  }, [knowledgeConfig, hasLoadedStoredState]);
+  useEffect(() => {
+    if (hasLoadedStoredState) setStored("agent-profile", profile);
+  }, [profile, hasLoadedStoredState]);
+  useEffect(() => {
+    if (hasLoadedStoredState) setStored("test-cases", cases);
+  }, [cases, hasLoadedStoredState]);
+  useEffect(() => {
+    if (hasLoadedStoredState) setStored("test-results", results);
+  }, [results, hasLoadedStoredState]);
 
   const summary = useMemo(() => {
     const latest = results.slice(0, cases.length || results.length);
@@ -676,6 +822,7 @@ export default function Home() {
       average,
     };
   }, [cases.length, results]);
+  const displayNotice = activeTab === "cases" && notice === defaultNotice ? testCasesNotice : notice;
 
   function updateProfileModule(moduleKey: ModuleKey, enabled: boolean) {
     setProfile((current) => ({
@@ -724,13 +871,14 @@ export default function Home() {
   }
 
   async function callAgent(testCase: TestCase) {
-    let conversationId = "";
+    let conversationId = buildConversationId(testCase);
     let dialogId = "";
     const rawResponses: unknown[] = [];
     let finalAnswer = "";
     let actualIntent = "";
     let knowledgeSource = "";
     let knowledgeReferences: KnowledgeReference[] = [];
+    let judgeEvaluation: JudgeEvaluation | undefined;
     let error = "";
     const start = performance.now();
 
@@ -755,6 +903,10 @@ export default function Home() {
           knowledgeSource = wsResult.knowledgeSource || knowledgeSource;
           conversationId = wsResult.conversationId || conversationId;
           dialogId = wsResult.dialogId || dialogId;
+          if (isAgentSystemException(finalAnswer)) {
+            error = agentSystemExceptionReason;
+            break;
+          }
         } else {
           const controller = new AbortController();
           const timeoutId = window.setTimeout(() => controller.abort(), agentConfig.timeoutSeconds * 1000);
@@ -793,6 +945,10 @@ export default function Home() {
           knowledgeSource = fields.knowledgeSource || knowledgeSource;
           conversationId = fields.conversationId || conversationId;
           dialogId = fields.dialogId || dialogId;
+          if (isAgentSystemException(finalAnswer)) {
+            error = agentSystemExceptionReason;
+            break;
+          }
         }
       }
 
@@ -838,22 +994,62 @@ export default function Home() {
             .join("；");
         }
       }
+
+      if (
+        !error &&
+        profile.enabledModules.knowledge &&
+        testCase.expectedAnswer.trim()
+      ) {
+        judgeEvaluation = isExactAnswerMatch(finalAnswer, testCase.expectedAnswer)
+          ? {
+              source: "judge-agent",
+              decision: "pass",
+              sameMeaning: true,
+              confidence: 1,
+              reason: "actual answer 与 expected answer 完全一致，平台直接判定为通过。",
+            }
+          : await callJudgeProxy(testCase, finalAnswer, agentConfig.timeoutSeconds);
+        rawResponses.push({
+          judgeEvaluation: {
+            source: judgeEvaluation.source,
+            decision: judgeEvaluation.decision,
+            sameMeaning: judgeEvaluation.sameMeaning,
+            confidence: judgeEvaluation.confidence,
+            keywordScore: judgeEvaluation.keywordScore,
+            reason: judgeEvaluation.reason,
+            error: judgeEvaluation.error,
+            rawAnswer: judgeEvaluation.rawAnswer,
+            rawResponse: judgeEvaluation.rawResponse,
+          },
+        });
+      }
     } catch (caught) {
       error = caught instanceof Error ? caught.message : "请求失败";
     }
 
     const durationMs = Math.round(performance.now() - start);
-    const scored = scoreResult({ profile, testCase, finalAnswer, actualIntent, knowledgeReferences, error, durationMs });
+    const scored = scoreResult({
+      profile,
+      testCase,
+      finalAnswer,
+      actualIntent,
+      knowledgeReferences,
+      judgeEvaluation,
+      error,
+      durationMs,
+    });
     return {
       id: `${testCase.id}-${Date.now()}`,
       caseId: testCase.id,
       caseTitle: testCase.title,
+      expectedAnswer: testCase.expectedAnswer,
       startedAt: new Date().toLocaleString("zh-CN"),
       durationMs,
       finalAnswer,
       actualIntent,
       knowledgeSource,
       knowledgeReferences,
+      judgeEvaluation,
       error,
       rawResponses,
       moduleScores: scored.moduleScores,
@@ -873,12 +1069,15 @@ export default function Home() {
     setNotice(`开始运行 ${runCases.length} 条测试用例。`);
     const nextResults: TestResult[] = [];
     for (const testCase of runCases) {
+      const needsJudge = profile.enabledModules.knowledge && testCase.expectedAnswer.trim();
       setNotice(`正在测试：${testCase.title}`);
+      setRunStage(needsJudge ? "调用被测 agent，随后进行 Judge Agent 语义判断。" : "调用被测 agent。");
       const result = await callAgent(testCase);
       nextResults.push(result);
       setResults((current) => [result, ...current]);
     }
     setIsRunning(false);
+    setRunStage("");
     setActiveTab("report");
     setNotice(`测试完成：${nextResults.length} 条用例已生成报告。`);
   }
@@ -896,9 +1095,39 @@ export default function Home() {
   }
 
   function exportCsv() {
-    const header = ["caseId", "caseTitle", "status", "totalScore", "intent", "durationMs", "answer", "error"];
+    const header = [
+      "caseId",
+      "caseTitle",
+      "status",
+      "totalScore",
+      "intent",
+      "durationMs",
+      "judgeSource",
+      "judgeDecision",
+      "sameMeaning",
+      "confidence",
+      "judgeReason",
+      "expectedAnswer",
+      "answer",
+      "error",
+    ];
     const lines = results.map((item) =>
-      [item.caseId, item.caseTitle, item.status, item.totalScore, item.actualIntent, item.durationMs, item.finalAnswer, item.error]
+      [
+        item.caseId,
+        item.caseTitle,
+        item.status,
+        item.totalScore,
+        item.actualIntent,
+        item.durationMs,
+        item.judgeEvaluation?.source ?? "",
+        item.judgeEvaluation?.decision ?? "",
+        item.judgeEvaluation?.sameMeaning ?? "",
+        item.judgeEvaluation?.confidence ?? "",
+        item.judgeEvaluation?.reason ?? "",
+        item.expectedAnswer ?? "",
+        item.finalAnswer,
+        item.error,
+      ]
         .map((value) => `"${String(value).replaceAll('"', '""')}"`)
         .join(","),
     );
@@ -975,7 +1204,7 @@ export default function Home() {
       </aside>
 
       <section className="workspace">
-        <div className="notice">{notice}</div>
+        <div className="notice">{displayNotice}</div>
 
         {activeTab === "setup" && (
           <div className="content-grid">
@@ -1200,11 +1429,14 @@ export default function Home() {
                       checked={profile.enabledModules[item.key]}
                       onChange={(event) => updateProfileModule(item.key, event.target.checked)}
                     />
-                    <span>
-                      <strong>{item.label}</strong>
-                      <small>{item.description}</small>
-                    </span>
-                  </label>
+	                    <span>
+	                      <strong>{item.label}</strong>
+	                      <small>{item.description}</small>
+	                      {item.key === "knowledge" && (
+	                        <small className="module-note">优先使用后端 Judge Agent；不可用时保留 keywordScore 参考并进入复核。</small>
+	                      )}
+	                    </span>
+	                  </label>
                 ))}
               </div>
               <div className="form-row">
@@ -1279,8 +1511,12 @@ export default function Home() {
                 {isRunning ? "运行中" : "运行选中用例"}
               </button>
             </div>
-            <div className="run-layout">
-              <div className="select-list">
+	            <div className="run-layout">
+	              <div className="run-status-panel">
+	                <strong>{isRunning ? "正在运行" : "准备运行"}</strong>
+	                <span>{isRunning ? runStage || "正在执行测试用例。" : "选中用例后开始批量测试，报告页会显示 Judge Agent 判定和人工复核入口。"}</span>
+	              </div>
+	              <div className="select-list">
                 {cases.map((testCase) => (
                   <label className="select-case" key={testCase.id}>
                     <input
@@ -1316,13 +1552,17 @@ export default function Home() {
                 <button onClick={exportJson}>导出 JSON</button>
               </div>
             </div>
-            <div className="metric-row">
-              <div><span>平均分</span><strong>{summary.average}</strong></div>
-              <div><span>通过</span><strong>{summary.pass}</strong></div>
-              <div><span>待复核</span><strong>{summary.review}</strong></div>
-              <div><span>失败</span><strong>{summary.fail}</strong></div>
-            </div>
-            <div className="result-list">
+	            <div className="metric-row">
+	              <div><span>平均分</span><strong>{summary.average}</strong></div>
+	              <div><span>通过</span><strong>{summary.pass}</strong></div>
+	              <div><span>待复核</span><strong>{summary.review}</strong></div>
+	              <div><span>失败</span><strong>{summary.fail}</strong></div>
+	            </div>
+	            <div className="report-legend">
+	              <span>Judge Agent 优先判断知识问答语义一致性</span>
+	              <span>review 表示 Judge 不确定、语义不一致需确认，或 Judge 不可用后进入 keywordScore 兜底复核</span>
+	            </div>
+	            <div className="result-list">
               {results.length === 0 && <p className="empty-state">还没有报告。运行测试后这里会显示每条用例的评分、失败原因和人工复核入口。</p>}
               {results.map((result) => (
                 <article className={`result-card ${result.status}`} key={result.id}>
@@ -1332,10 +1572,45 @@ export default function Home() {
                       <small>{result.startedAt} · {result.durationMs}ms · intent: {result.actualIntent || "未返回"}</small>
                     </div>
                     <span>{result.totalScore}</span>
-                  </div>
-                  {result.error && <p className="error-text">{result.error}</p>}
-                  <p className="answer-text">{result.finalAnswer || "无回答"}</p>
-                  <details className="raw-response-panel">
+	                  </div>
+	                  {result.error && <p className="error-text">{result.error}</p>}
+	                  <div className="answer-compare-grid">
+	                    <div className="answer-panel expected-answer-panel">
+	                      <strong>期望回答</strong>
+	                      <p>{result.expectedAnswer || "未配置"}</p>
+	                    </div>
+	                    <div className="answer-panel actual-answer-panel">
+	                      <strong>实际回答</strong>
+	                      <p>{result.finalAnswer || "无回答"}</p>
+	                    </div>
+	                  </div>
+	                  {result.judgeEvaluation && (
+	                    <div className={`judge-panel ${result.judgeEvaluation.decision}`}>
+	                      <div>
+	                        <strong>Judge Agent 语义判断</strong>
+	                        <span>{result.judgeEvaluation.decision}</span>
+	                      </div>
+	                      <small>
+	                        {[
+	                          result.judgeEvaluation.source,
+	                          result.judgeEvaluation.sameMeaning === undefined
+	                            ? ""
+	                            : `sameMeaning: ${result.judgeEvaluation.sameMeaning}`,
+	                          result.judgeEvaluation.confidence === undefined
+	                            ? ""
+	                            : `confidence: ${Math.round(result.judgeEvaluation.confidence * 100)}%`,
+	                          result.judgeEvaluation.keywordScore === undefined
+	                            ? ""
+	                            : `keywordScore: ${result.judgeEvaluation.keywordScore}`,
+	                        ]
+	                          .filter(Boolean)
+	                          .join(" · ")}
+	                      </small>
+	                      <p>{result.judgeEvaluation.reason}</p>
+	                      {result.judgeEvaluation.error && <em>{result.judgeEvaluation.error}</em>}
+	                    </div>
+	                  )}
+	                  <details className="raw-response-panel">
                     <summary>查看接口原始返回</summary>
                     <pre>{JSON.stringify(result.rawResponses, null, 2)}</pre>
                   </details>
